@@ -61,6 +61,14 @@
 #define BARO_AUTOZERO 1
 #endif
 
+#ifndef DEBUG_LED_ENABLED
+#define DEBUG_LED_ENABLED 0
+#endif
+
+#ifndef DEBUG_LED_PIN
+#define DEBUG_LED_PIN 48
+#endif
+
 #if defined(CONFIG_IDF_TARGET_ESP32S3) && ARDUINO_USB_MODE
 #define CONSOLE USBSerial
 #else
@@ -101,6 +109,9 @@ float barometerDiffOffsetPa = 0.0f;
 uint32_t barometerSampleCount = 0;
 uint32_t barometerFailureCount = 0;
 uint32_t lastBarometerSampleMs = 0;
+uint32_t lastDebugLedUpdateMs = 0;
+uint32_t lastFlightControllerRequestMs = 0;
+uint32_t lastLedRequestCount = 0;
 uint32_t lastRampMs = 0;
 char commandBuffer[96] = {0};
 size_t commandLength = 0;
@@ -229,6 +240,7 @@ void printStatus() {
   CONSOLE.printf("  scl_pin: %d\n", I2C_SCL_PIN);
   CONSOLE.printf("  baro_sda_pin: %d\n", BARO_I2C_SDA_PIN);
   CONSOLE.printf("  baro_scl_pin: %d\n", BARO_I2C_SCL_PIN);
+  CONSOLE.printf("  debug_led: %s pin=%d\n", DEBUG_LED_ENABLED ? "enabled" : "disabled", DEBUG_LED_PIN);
   CONSOLE.printf("  bus_hz: %u\n", static_cast<unsigned>(I2C_BUS_HZ));
   CONSOLE.printf("  frame: %02X %02X %02X %02X\n", frame[0], frame[1], frame[2], frame[3]);
   CONSOLE.printf("  i2c_requests: %lu\n", static_cast<unsigned long>(requestCount));
@@ -252,6 +264,16 @@ void setTemperature(float temperatureC) {
 float speedKmhToPressurePa(float speedKmh) {
   const float speedMs = speedKmh / 3.6f;
   return 0.5f * kAirDensityKgM3 * speedMs * speedMs;
+}
+
+void setDebugLed(uint8_t red, uint8_t green, uint8_t blue) {
+#if DEBUG_LED_ENABLED
+  neopixelWrite(DEBUG_LED_PIN, red, green, blue);
+#else
+  (void)red;
+  (void)green;
+  (void)blue;
+#endif
 }
 
 void setBarometerOffsetToCurrentReading() {
@@ -439,11 +461,58 @@ bool updateBarometers() {
 #endif
 }
 
+void updateDebugLed() {
+#if DEBUG_LED_ENABLED
+  const uint32_t now = millis();
+  if (now - lastDebugLedUpdateMs < 100) {
+    return;
+  }
+  lastDebugLedUpdateMs = now;
+
+  const bool requestSeen = requestCount != 0;
+  const bool requestPulse = requestCount != lastLedRequestCount;
+  if (requestPulse) {
+    lastFlightControllerRequestMs = now;
+  }
+  lastLedRequestCount = requestCount;
+  const bool recentRequest = requestSeen && (now - lastFlightControllerRequestMs) < 2000;
+
+  uint8_t red = 0;
+  uint8_t green = 0;
+  uint8_t blue = 0;
+
+  const bool ledOn = ((now / 500) % 2) == 0;
+  const bool shortPulse = ((now / 100) % 10) == 0;
+
+  if (!recentRequest) {
+    red = ledOn ? 10 : 0;
+    blue = ledOn ? 24 : 0;
+  } else if (barometersEnabled && barometerReading1.valid && barometerReading2.valid) {
+    green = ledOn ? 24 : 2;
+  } else if (barometersEnabled && (barometer1Online || barometer2Online)) {
+    red = ledOn ? 28 : 4;
+    green = ledOn ? 8 : 0;
+  } else if (rampEnabled) {
+    red = ledOn ? 24 : 4;
+    green = ledOn ? 12 : 0;
+  } else {
+    blue = ledOn ? 24 : 3;
+  }
+
+  if (requestPulse || shortPulse) {
+    blue = max<uint8_t>(blue, 12);
+  }
+
+  setDebugLed(red, green, blue);
+#endif
+}
+
 } // namespace
 
 void setup() {
   CONSOLE.begin(MONITOR_BAUD);
   delay(500);
+  setDebugLed(8, 8, 8);
 
   updateResponseFrame();
   initBarometers();
@@ -478,5 +547,6 @@ void loop() {
   if (!updateBarometers()) {
     updateRamp();
   }
+  updateDebugLed();
   delay(5);
 }

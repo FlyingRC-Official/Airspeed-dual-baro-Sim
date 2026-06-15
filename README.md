@@ -11,6 +11,7 @@ Version 2 can read two SPA06-003 barometers over a second I2C bus and expose the
 - I2C slave address: `0x28`
 - ESP32-S3 flight-controller I2C slave pins: SDA `GPIO8`, SCL `GPIO9`
 - ESP32-S3 barometer I2C master pins: SDA `GPIO4`, SCL `GPIO5`
+- ESP32-S3 WS2812 debug LED pin: `GPIO48`
 - Classic ESP32 flight-controller I2C slave pins: SDA `GPIO21`, SCL `GPIO22`
 - Classic ESP32 barometer I2C master pins: SDA `GPIO4`, SCL `GPIO5`
 - Barometer 1 address: `0x76`
@@ -20,6 +21,14 @@ Version 2 can read two SPA06-003 barometers over a second I2C bus and expose the
 Connect SDA, SCL, and GND to the flight controller I2C bus. Use 3.3 V-compatible pullups.
 
 Connect both SPA06-003 barometers to the barometer I2C bus. Put one sensor at `0x76` and the other at `0x77`.
+
+The WS2812 debug LED shows firmware state:
+
+- Purple blink: waiting for flight-controller I2C reads
+- Green heartbeat: using live dual-barometer differential pressure
+- Red/orange heartbeat: barometer input enabled but not fully healthy
+- Amber heartbeat: fallback fake ramp is active
+- Blue heartbeat: manual/static pressure mode
 
 ## Build
 
