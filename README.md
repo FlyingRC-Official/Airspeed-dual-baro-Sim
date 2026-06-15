@@ -45,12 +45,12 @@ python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem101 run
 - `p <pa>`: set fake differential pressure in Pascals
 - `t <c>`: set fake temperature in Celsius
 - `z`: set pressure to zero
-- `r on`: enable a slow fake pressure ramp
+- `r on`: enable the fake airspeed ramp
 - `r off`: disable the pressure ramp
 - `s`: print current state and raw MS4525 frame bytes
 - `h`: print help
 
-Default boot state is `0 Pa`, `25 C`, ramp off.
+Default boot state is `25 C` with ramp on. The default ramp rises from `0 km/h` to `100 km/h` in 10 seconds, then falls from `100 km/h` to `0 km/h` in 10 seconds, repeating continuously.
 
 ## ArduPilot Setup
 

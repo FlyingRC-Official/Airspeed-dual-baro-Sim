@@ -38,6 +38,10 @@ namespace {
 constexpr float kPsiToPa = 6894.757f;
 constexpr float kRawFullScale = 16383.0f;
 constexpr float kTempRawFullScale = 2047.0f;
+constexpr float kAirDensityKgM3 = 1.225f;
+constexpr float kRampMaxSpeedKmh = 100.0f;
+constexpr uint32_t kRampHalfPeriodMs = 10000;
+constexpr uint32_t kRampFullPeriodMs = kRampHalfPeriodMs * 2;
 
 portMUX_TYPE frameMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t responseFrame[4] = {0};
@@ -49,7 +53,7 @@ volatile uint8_t lastReceiveByte = 0;
 
 float fakePressurePa = 0.0f;
 float fakeTemperatureC = 25.0f;
-bool rampEnabled = false;
+bool rampEnabled = true;
 uint32_t lastRampMs = 0;
 char commandBuffer[96] = {0};
 size_t commandLength = 0;
@@ -134,7 +138,7 @@ void printHelp() {
   CONSOLE.println(F("  p <pa>   set fake differential pressure in Pascals"));
   CONSOLE.println(F("  t <c>    set fake temperature in Celsius"));
   CONSOLE.println(F("  z        set pressure to 0 Pa"));
-  CONSOLE.println(F("  r on     enable slow fake pressure ramp"));
+  CONSOLE.println(F("  r on     enable 0-100-0 km/h fake airspeed ramp"));
   CONSOLE.println(F("  r off    disable slow fake pressure ramp"));
   CONSOLE.println(F("  s        print current state"));
   CONSOLE.println(F("  h        print this help"));
@@ -150,6 +154,9 @@ void printStatus() {
   CONSOLE.printf("  pressure_pa: %.2f\n", fakePressurePa);
   CONSOLE.printf("  temperature_c: %.2f\n", fakeTemperatureC);
   CONSOLE.printf("  ramp: %s\n", rampEnabled ? "on" : "off");
+  CONSOLE.printf("  ramp_profile: 0-%.0f-0 km/h over %lu seconds\n",
+                 kRampMaxSpeedKmh,
+                 static_cast<unsigned long>(kRampFullPeriodMs / 1000));
   CONSOLE.printf("  i2c_address: 0x%02X\n", I2C_SLAVE_ADDRESS);
   CONSOLE.printf("  sda_pin: %d\n", I2C_SDA_PIN);
   CONSOLE.printf("  scl_pin: %d\n", I2C_SCL_PIN);
@@ -171,6 +178,11 @@ void setPressure(float pressurePa) {
 void setTemperature(float temperatureC) {
   fakeTemperatureC = temperatureC;
   updateResponseFrame();
+}
+
+float speedKmhToPressurePa(float speedKmh) {
+  const float speedMs = speedKmh / 3.6f;
+  return 0.5f * kAirDensityKgM3 * speedMs * speedMs;
 }
 
 void handleCommand(char *line) {
@@ -255,14 +267,19 @@ void updateRamp() {
   }
 
   const uint32_t now = millis();
-  if (now - lastRampMs < 100) {
+  if (now - lastRampMs < 50) {
     return;
   }
   lastRampMs = now;
 
-  const float phase = static_cast<float>(now % 20000UL) / 20000.0f;
-  const float wave = phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f;
-  setPressure(wave * 250.0f);
+  const uint32_t rampTimeMs = now % kRampFullPeriodMs;
+  const float speedKmh = rampTimeMs <= kRampHalfPeriodMs
+                             ? kRampMaxSpeedKmh * static_cast<float>(rampTimeMs) /
+                                   static_cast<float>(kRampHalfPeriodMs)
+                             : kRampMaxSpeedKmh *
+                                   static_cast<float>(kRampFullPeriodMs - rampTimeMs) /
+                                   static_cast<float>(kRampHalfPeriodMs);
+  setPressure(speedKmhToPressurePa(speedKmh));
 }
 
 } // namespace
