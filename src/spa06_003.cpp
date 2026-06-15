@@ -14,7 +14,7 @@ bool Spa06Barometer::begin(TwoWire &wire, uint8_t address) {
   }
   delay(10);
 
-  if (!waitReady(0xC0, 100)) {
+  if (!waitReady(0xC0, 1000)) {
     return false;
   }
 

@@ -287,18 +287,48 @@ void setBarometerOffsetToCurrentReading() {
   barometerOffsetValid = true;
 }
 
+bool barometerAddressResponds(uint8_t address) {
+  Wire1.beginTransmission(address);
+  return Wire1.endTransmission() == 0;
+}
+
+void autoDetectMissingBarometers() {
+  if (barometer1Online && barometer2Online) {
+    return;
+  }
+
+  for (uint8_t address = 0x08; address <= 0x77 && (!barometer1Online || !barometer2Online); address++) {
+    if ((barometer1Online && address == barometer1.address()) ||
+        (barometer2Online && address == barometer2.address())) {
+      continue;
+    }
+    if (!barometerAddressResponds(address)) {
+      continue;
+    }
+
+    if (!barometer1Online && barometer1.begin(Wire1, address)) {
+      barometer1Online = true;
+      continue;
+    }
+    if (!barometer2Online && barometer2.begin(Wire1, address)) {
+      barometer2Online = true;
+    }
+  }
+}
+
 void initBarometers() {
 #if USE_BAROMETERS
   Wire1.begin(BARO_I2C_SDA_PIN, BARO_I2C_SCL_PIN, BARO_I2C_HZ);
   barometer1Online = barometer1.begin(Wire1, BARO1_I2C_ADDRESS);
   barometer2Online = barometer2.begin(Wire1, BARO2_I2C_ADDRESS);
+  autoDetectMissingBarometers();
 
   CONSOLE.printf("Barometer bus SDA=%d SCL=%d hz=%u\n",
                  BARO_I2C_SDA_PIN,
                  BARO_I2C_SCL_PIN,
                  static_cast<unsigned>(BARO_I2C_HZ));
-  CONSOLE.printf("Barometer 1 %s at 0x%02X\n", barometer1Online ? "found" : "missing", BARO1_I2C_ADDRESS);
-  CONSOLE.printf("Barometer 2 %s at 0x%02X\n", barometer2Online ? "found" : "missing", BARO2_I2C_ADDRESS);
+  CONSOLE.printf("Barometer 1 %s at 0x%02X\n", barometer1Online ? "found" : "missing", barometer1.address());
+  CONSOLE.printf("Barometer 2 %s at 0x%02X\n", barometer2Online ? "found" : "missing", barometer2.address());
 #endif
 }
 
@@ -441,8 +471,13 @@ bool updateBarometers() {
 
   if (!read1 || !read2) {
     barometerFailureCount++;
-    return barometerReading1.valid && barometerReading2.valid && (now - barometerReading1.updatedMs) < 500 &&
-           (now - barometerReading2.updatedMs) < 500;
+    const bool staleButUsable = barometerReading1.valid && barometerReading2.valid &&
+                                (now - barometerReading1.updatedMs) < 500 &&
+                                (now - barometerReading2.updatedMs) < 500;
+    if (!staleButUsable) {
+      setPressure(0.0f);
+    }
+    return staleButUsable;
   }
 
   barometerSampleCount++;
@@ -492,6 +527,8 @@ void updateDebugLed() {
   } else if (barometersEnabled && (barometer1Online || barometer2Online)) {
     red = ledOn ? 28 : 4;
     green = ledOn ? 8 : 0;
+  } else if (barometersEnabled) {
+    red = ledOn ? 28 : 4;
   } else if (rampEnabled) {
     red = ledOn ? 24 : 4;
     green = ledOn ? 12 : 0;
@@ -544,7 +581,7 @@ void setup() {
 
 void loop() {
   pollSerialCommands();
-  if (!updateBarometers()) {
+  if (!updateBarometers() && !barometersEnabled) {
     updateRamp();
   }
   updateDebugLed();
