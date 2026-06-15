@@ -2,18 +2,24 @@
 
 ESP32/ESP32-S3 firmware that emulates an MS4525 differential pressure airspeed sensor as an I2C slave for ArduPilot bring-up.
 
-Version 1 does not read real barometer sensors. It returns fake, serial-adjustable MS4525 frames so a flight controller running ArduPilot can detect the device and read plausible airspeed data.
+Version 2 can read two SPA06-003 barometers over a second I2C bus and expose their differential pressure as an MS4525-compatible airspeed sensor. If the barometers are not available, it falls back to the fake 0-100-0 km/h ramp used by V1.
 
 ## Hardware Defaults
 
 - Primary target: ESP32-S3 DevKitC, PlatformIO env `esp32-s3-devkitc-1`
 - Fallback target: classic ESP32 DevKit, PlatformIO env `esp32dev`
 - I2C slave address: `0x28`
-- ESP32-S3 I2C pins: SDA `GPIO8`, SCL `GPIO9`
-- Classic ESP32 I2C pins: SDA `GPIO21`, SCL `GPIO22`
+- ESP32-S3 flight-controller I2C slave pins: SDA `GPIO8`, SCL `GPIO9`
+- ESP32-S3 barometer I2C master pins: SDA `GPIO4`, SCL `GPIO5`
+- Classic ESP32 flight-controller I2C slave pins: SDA `GPIO21`, SCL `GPIO22`
+- Classic ESP32 barometer I2C master pins: SDA `GPIO4`, SCL `GPIO5`
+- Barometer 1 address: `0x76`
+- Barometer 2 address: `0x77`
 - Serial monitor: `115200`
 
 Connect SDA, SCL, and GND to the flight controller I2C bus. Use 3.3 V-compatible pullups.
+
+Connect both SPA06-003 barometers to the barometer I2C bus. Put one sensor at `0x76` and the other at `0x77`.
 
 ## Build
 
@@ -47,10 +53,13 @@ python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem101 run
 - `z`: set pressure to zero
 - `r on`: enable the fake airspeed ramp
 - `r off`: disable the pressure ramp
+- `b on`: enable real dual-barometer input
+- `b off`: disable real dual-barometer input
+- `c`: zero the current barometer differential pressure
 - `s`: print current state and raw MS4525 frame bytes
 - `h`: print help
 
-Default boot state is `25 C` with ramp on. The default ramp rises from `0 km/h` to `100 km/h` in 10 seconds, then falls from `100 km/h` to `0 km/h` in 10 seconds, repeating continuously.
+Default boot state enables real barometers. The firmware automatically zeroes the first valid barometer differential pressure reading. If either barometer is missing, it falls back to the fake ramp, which rises from `0 km/h` to `100 km/h` in 10 seconds, then falls from `100 km/h` to `0 km/h` in 10 seconds, repeating continuously.
 
 ## ArduPilot Setup
 

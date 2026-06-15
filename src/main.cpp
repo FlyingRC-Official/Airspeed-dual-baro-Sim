@@ -3,6 +3,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "spa06_003.h"
+
 #ifndef MONITOR_BAUD
 #define MONITOR_BAUD 115200
 #endif
@@ -25,6 +27,38 @@
 
 #ifndef MS4525_PSI_RANGE
 #define MS4525_PSI_RANGE 1.0f
+#endif
+
+#ifndef USE_BAROMETERS
+#define USE_BAROMETERS 1
+#endif
+
+#ifndef BARO_I2C_SDA_PIN
+#define BARO_I2C_SDA_PIN 4
+#endif
+
+#ifndef BARO_I2C_SCL_PIN
+#define BARO_I2C_SCL_PIN 5
+#endif
+
+#ifndef BARO_I2C_HZ
+#define BARO_I2C_HZ 400000
+#endif
+
+#ifndef BARO1_I2C_ADDRESS
+#define BARO1_I2C_ADDRESS 0x76
+#endif
+
+#ifndef BARO2_I2C_ADDRESS
+#define BARO2_I2C_ADDRESS 0x77
+#endif
+
+#ifndef BARO_DIFF_SIGN
+#define BARO_DIFF_SIGN 1
+#endif
+
+#ifndef BARO_AUTOZERO
+#define BARO_AUTOZERO 1
 #endif
 
 #if defined(CONFIG_IDF_TARGET_ESP32S3) && ARDUINO_USB_MODE
@@ -51,9 +85,22 @@ volatile uint32_t measurementCommandCount = 0;
 volatile uint8_t lastReceiveLength = 0;
 volatile uint8_t lastReceiveByte = 0;
 
+Spa06Barometer barometer1;
+Spa06Barometer barometer2;
+BarometerReading barometerReading1;
+BarometerReading barometerReading2;
+
 float fakePressurePa = 0.0f;
 float fakeTemperatureC = 25.0f;
 bool rampEnabled = true;
+bool barometersEnabled = USE_BAROMETERS != 0;
+bool barometer1Online = false;
+bool barometer2Online = false;
+bool barometerOffsetValid = false;
+float barometerDiffOffsetPa = 0.0f;
+uint32_t barometerSampleCount = 0;
+uint32_t barometerFailureCount = 0;
+uint32_t lastBarometerSampleMs = 0;
 uint32_t lastRampMs = 0;
 char commandBuffer[96] = {0};
 size_t commandLength = 0;
@@ -140,6 +187,9 @@ void printHelp() {
   CONSOLE.println(F("  z        set pressure to 0 Pa"));
   CONSOLE.println(F("  r on     enable 0-100-0 km/h fake airspeed ramp"));
   CONSOLE.println(F("  r off    disable slow fake pressure ramp"));
+  CONSOLE.println(F("  b on     enable real dual-barometer input"));
+  CONSOLE.println(F("  b off    disable real dual-barometer input"));
+  CONSOLE.println(F("  c        zero current barometer differential pressure"));
   CONSOLE.println(F("  s        print current state"));
   CONSOLE.println(F("  h        print this help"));
   CONSOLE.println();
@@ -154,12 +204,31 @@ void printStatus() {
   CONSOLE.printf("  pressure_pa: %.2f\n", fakePressurePa);
   CONSOLE.printf("  temperature_c: %.2f\n", fakeTemperatureC);
   CONSOLE.printf("  ramp: %s\n", rampEnabled ? "on" : "off");
+  CONSOLE.printf("  barometers: %s\n", barometersEnabled ? "enabled" : "disabled");
+  CONSOLE.printf("  baro1: %s addr=0x%02X pressure_pa=%.2f temp_c=%.2f\n",
+                 barometer1Online ? "online" : "offline",
+                 BARO1_I2C_ADDRESS,
+                 barometerReading1.pressurePa,
+                 barometerReading1.temperatureC);
+  CONSOLE.printf("  baro2: %s addr=0x%02X pressure_pa=%.2f temp_c=%.2f\n",
+                 barometer2Online ? "online" : "offline",
+                 BARO2_I2C_ADDRESS,
+                 barometerReading2.pressurePa,
+                 barometerReading2.temperatureC);
+  CONSOLE.printf("  baro_diff_offset_pa: %.2f valid=%s\n",
+                 barometerDiffOffsetPa,
+                 barometerOffsetValid ? "yes" : "no");
+  CONSOLE.printf("  baro_samples: %lu failures=%lu\n",
+                 static_cast<unsigned long>(barometerSampleCount),
+                 static_cast<unsigned long>(barometerFailureCount));
   CONSOLE.printf("  ramp_profile: 0-%.0f-0 km/h over %lu seconds\n",
                  kRampMaxSpeedKmh,
                  static_cast<unsigned long>(kRampFullPeriodMs / 1000));
   CONSOLE.printf("  i2c_address: 0x%02X\n", I2C_SLAVE_ADDRESS);
   CONSOLE.printf("  sda_pin: %d\n", I2C_SDA_PIN);
   CONSOLE.printf("  scl_pin: %d\n", I2C_SCL_PIN);
+  CONSOLE.printf("  baro_sda_pin: %d\n", BARO_I2C_SDA_PIN);
+  CONSOLE.printf("  baro_scl_pin: %d\n", BARO_I2C_SCL_PIN);
   CONSOLE.printf("  bus_hz: %u\n", static_cast<unsigned>(I2C_BUS_HZ));
   CONSOLE.printf("  frame: %02X %02X %02X %02X\n", frame[0], frame[1], frame[2], frame[3]);
   CONSOLE.printf("  i2c_requests: %lu\n", static_cast<unsigned long>(requestCount));
@@ -185,6 +254,32 @@ float speedKmhToPressurePa(float speedKmh) {
   return 0.5f * kAirDensityKgM3 * speedMs * speedMs;
 }
 
+void setBarometerOffsetToCurrentReading() {
+  if (!barometerReading1.valid || !barometerReading2.valid) {
+    return;
+  }
+
+  const float signedDiffPa =
+      (barometerReading1.pressurePa - barometerReading2.pressurePa) * static_cast<float>(BARO_DIFF_SIGN);
+  barometerDiffOffsetPa = signedDiffPa;
+  barometerOffsetValid = true;
+}
+
+void initBarometers() {
+#if USE_BAROMETERS
+  Wire1.begin(BARO_I2C_SDA_PIN, BARO_I2C_SCL_PIN, BARO_I2C_HZ);
+  barometer1Online = barometer1.begin(Wire1, BARO1_I2C_ADDRESS);
+  barometer2Online = barometer2.begin(Wire1, BARO2_I2C_ADDRESS);
+
+  CONSOLE.printf("Barometer bus SDA=%d SCL=%d hz=%u\n",
+                 BARO_I2C_SDA_PIN,
+                 BARO_I2C_SCL_PIN,
+                 static_cast<unsigned>(BARO_I2C_HZ));
+  CONSOLE.printf("Barometer 1 %s at 0x%02X\n", barometer1Online ? "found" : "missing", BARO1_I2C_ADDRESS);
+  CONSOLE.printf("Barometer 2 %s at 0x%02X\n", barometer2Online ? "found" : "missing", BARO2_I2C_ADDRESS);
+#endif
+}
+
 void handleCommand(char *line) {
   while (*line == ' ' || *line == '\t') {
     line++;
@@ -205,6 +300,7 @@ void handleCommand(char *line) {
   }
 
   if (strcmp(line, "z") == 0) {
+    barometersEnabled = false;
     rampEnabled = false;
     setPressure(0.0f);
     CONSOLE.println(F("pressure_pa=0.00"));
@@ -213,6 +309,7 @@ void handleCommand(char *line) {
 
   float value = 0.0f;
   if (sscanf(line, "p %f", &value) == 1) {
+    barometersEnabled = false;
     rampEnabled = false;
     setPressure(value);
     CONSOLE.printf("pressure_pa=%.2f\n", fakePressurePa);
@@ -226,6 +323,7 @@ void handleCommand(char *line) {
   }
 
   if (strcmp(line, "r on") == 0) {
+    barometersEnabled = false;
     rampEnabled = true;
     lastRampMs = millis();
     CONSOLE.println(F("ramp=on"));
@@ -235,6 +333,26 @@ void handleCommand(char *line) {
   if (strcmp(line, "r off") == 0) {
     rampEnabled = false;
     CONSOLE.println(F("ramp=off"));
+    return;
+  }
+
+  if (strcmp(line, "b on") == 0) {
+    barometersEnabled = true;
+    CONSOLE.println(F("barometers=on"));
+    return;
+  }
+
+  if (strcmp(line, "b off") == 0) {
+    barometersEnabled = false;
+    CONSOLE.println(F("barometers=off"));
+    return;
+  }
+
+  if (strcmp(line, "c") == 0 || strcmp(line, "zero") == 0) {
+    setBarometerOffsetToCurrentReading();
+    CONSOLE.printf("baro_diff_offset_pa=%.2f valid=%s\n",
+                   barometerDiffOffsetPa,
+                   barometerOffsetValid ? "yes" : "no");
     return;
   }
 
@@ -282,6 +400,45 @@ void updateRamp() {
   setPressure(speedKmhToPressurePa(speedKmh));
 }
 
+bool updateBarometers() {
+#if !USE_BAROMETERS
+  return false;
+#else
+  if (!barometersEnabled) {
+    return false;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastBarometerSampleMs < 50) {
+    return barometerReading1.valid && barometerReading2.valid;
+  }
+  lastBarometerSampleMs = now;
+
+  const bool read1 = barometer1Online && barometer1.read(barometerReading1);
+  const bool read2 = barometer2Online && barometer2.read(barometerReading2);
+
+  if (!read1 || !read2) {
+    barometerFailureCount++;
+    return barometerReading1.valid && barometerReading2.valid && (now - barometerReading1.updatedMs) < 500 &&
+           (now - barometerReading2.updatedMs) < 500;
+  }
+
+  barometerSampleCount++;
+  const float signedDiffPa =
+      (barometerReading1.pressurePa - barometerReading2.pressurePa) * static_cast<float>(BARO_DIFF_SIGN);
+#if BARO_AUTOZERO
+  if (!barometerOffsetValid) {
+    barometerDiffOffsetPa = signedDiffPa;
+    barometerOffsetValid = true;
+  }
+#endif
+
+  setPressure(signedDiffPa - barometerDiffOffsetPa);
+  setTemperature((barometerReading1.temperatureC + barometerReading2.temperatureC) * 0.5f);
+  return true;
+#endif
+}
+
 } // namespace
 
 void setup() {
@@ -289,6 +446,7 @@ void setup() {
   delay(500);
 
   updateResponseFrame();
+  initBarometers();
 
   Wire.onReceive(onI2CReceive);
   Wire.onRequest(onI2CRequest);
@@ -317,6 +475,8 @@ void setup() {
 
 void loop() {
   pollSerialCommands();
-  updateRamp();
+  if (!updateBarometers()) {
+    updateRamp();
+  }
   delay(5);
 }
