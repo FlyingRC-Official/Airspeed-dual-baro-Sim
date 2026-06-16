@@ -8,16 +8,16 @@ Version 2 can read two SPA06-003 barometers over a second I2C bus and expose the
 
 - Primary target: ESP32-S3 DevKitC, PlatformIO env `esp32-s3-devkitc-1`
 - Fallback target: classic ESP32 DevKit, PlatformIO env `esp32dev`
-- Experimental STM32 target: STM32G031G6U6, PlatformIO env `stm32g031g6u6`
+- Experimental STM32 target: STM32G031G8U6, PlatformIO env `stm32g031g8u6`
 - I2C slave address: `0x28`
 - ESP32-S3 flight-controller I2C slave pins: SDA `GPIO8`, SCL `GPIO9`
 - ESP32-S3 barometer I2C master pins: SDA `GPIO4`, SCL `GPIO5`
 - ESP32-S3 WS2812 debug LED pin: `GPIO48`
 - Classic ESP32 flight-controller I2C slave pins: SDA `GPIO21`, SCL `GPIO22`
 - Classic ESP32 barometer I2C master pins: SDA `GPIO4`, SCL `GPIO5`
-- STM32G031G6U6 flight-controller I2C slave pins: I2C1 SCL `PB6`, SDA `PB7`
-- STM32G031G6U6 barometer I2C master pins: I2C2 SCL `PA11`, SDA `PA12`
-- STM32G031G6U6 WS2812 debug LED pin: `PA8` by default
+- STM32G031G8U6 flight-controller I2C slave pins: I2C1 SCL `PB6`, SDA `PB7`
+- STM32G031G8U6 barometer I2C master pins: I2C2 SCL `PA11`, SDA `PA12`
+- STM32G031G8U6 WS2812 debug LED pin: `PA8` by default
 - Barometer 1 address: `0x76`
 - Barometer 2 address: `0x77`
 - Serial monitor: `115200`
@@ -46,13 +46,13 @@ Fallback classic ESP32 build:
 pio run -e esp32dev
 ```
 
-Experimental STM32G031G6U6 build:
+Experimental STM32G031G8U6 build:
 
 ```sh
-pio run -e stm32g031g6u6
+pio run -e stm32g031g8u6
 ```
 
-The STM32G031G6U6 port is a lean STM32Cube/HAL firmware. It keeps the MS4525 I2C slave, dual SPA06 barometer input, startup auto-zero, and WS2812 state LED, but does not include the ESP32 serial command interface.
+The STM32G031G8U6 port is a lean STM32Cube/HAL firmware. It keeps the MS4525 I2C slave, dual SPA06 barometer input, startup auto-zero, and WS2812 state LED, but does not include the ESP32 serial command interface.
 
 ## Upload And Monitor
 
