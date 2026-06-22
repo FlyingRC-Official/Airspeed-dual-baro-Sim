@@ -1,4 +1,5 @@
 #include "stm32g0xx_hal.h"
+#include "ws2812.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -39,6 +40,14 @@
 #define DEBUG_LED_GPIO_PIN GPIO_PIN_8
 #endif
 
+#ifndef DEBUG_LED_TEST
+#define DEBUG_LED_TEST 0
+#endif
+
+#ifndef DEBUG_LED_GPIO_TEST
+#define DEBUG_LED_GPIO_TEST 0
+#endif
+
 #define SPA06_REG_PRESSURE 0x00
 #define SPA06_REG_TEMPERATURE 0x03
 #define SPA06_REG_PRESSURE_CONFIG 0x06
@@ -53,7 +62,7 @@
 #define SPA06_RATE_16HZ 4
 #define SPA06_SCALE_8X 7864320.0f
 
-#define I2C_TIMING_100KHZ_16MHZ 0x00303D5BU
+#define I2C_TIMING_100KHZ_64MHZ 0x30303D5BU
 #define MS4525_FRAME_LEN 4U
 
 typedef struct {
@@ -95,6 +104,8 @@ static bool offset_valid = false;
 static uint32_t last_led_update_ms = 0;
 static uint32_t last_fc_request_ms = 0;
 static uint32_t last_led_request_count = 0;
+static uint32_t last_fc_flash_ms = 0;
+static uint32_t fc_flash_until_ms = 0;
 
 static int16_t sign_extend_12(uint16_t value) {
   value &= 0x0FFFU;
@@ -149,6 +160,7 @@ static bool i2c_read8(I2C_HandleTypeDef *i2c, uint8_t address, uint8_t reg, uint
 
 static void debug_led_init(void) {
 #if DEBUG_LED_ENABLED
+#if DEBUG_LED_GPIO_TEST
   GPIO_InitTypeDef gpio = {0};
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -158,51 +170,48 @@ static void debug_led_init(void) {
   gpio.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(DEBUG_LED_GPIO_PORT, &gpio);
   DEBUG_LED_GPIO_PORT->BRR = DEBUG_LED_GPIO_PIN;
-#endif
-}
-
-static void ws2812_delay(uint32_t cycles) {
-  while (cycles--) {
-    __NOP();
-  }
-}
-
-static void ws2812_send_bit(bool one) {
-#if DEBUG_LED_ENABLED
-  DEBUG_LED_GPIO_PORT->BSRR = DEBUG_LED_GPIO_PIN;
-  if (one) {
-    ws2812_delay(7);
-    DEBUG_LED_GPIO_PORT->BRR = DEBUG_LED_GPIO_PIN;
-    ws2812_delay(4);
-  } else {
-    ws2812_delay(2);
-    DEBUG_LED_GPIO_PORT->BRR = DEBUG_LED_GPIO_PIN;
-    ws2812_delay(9);
-  }
 #else
-  (void)one;
+  ws2812_init();
+#endif
 #endif
 }
 
-static void ws2812_send_byte(uint8_t value) {
-  for (uint8_t mask = 0x80; mask != 0; mask >>= 1) {
-    ws2812_send_bit((value & mask) != 0);
-  }
-}
 
 static void set_debug_led(uint8_t red, uint8_t green, uint8_t blue) {
 #if DEBUG_LED_ENABLED
-  __disable_irq();
-  ws2812_send_byte(green);
-  ws2812_send_byte(red);
-  ws2812_send_byte(blue);
-  __enable_irq();
+  ws2812_write_rgb(red, green, blue);
 #else
   (void)red;
   (void)green;
   (void)blue;
 #endif
 }
+
+#if DEBUG_LED_ENABLED && DEBUG_LED_TEST
+static void run_debug_led_test(void) {
+  while (1) {
+    set_debug_led(0, 0, 0);
+    HAL_Delay(1000);
+    set_debug_led(24, 0, 0);
+    HAL_Delay(1000);
+    set_debug_led(0, 24, 0);
+    HAL_Delay(1000);
+    set_debug_led(0, 0, 24);
+    HAL_Delay(1000);
+  }
+}
+#endif
+
+#if DEBUG_LED_ENABLED && DEBUG_LED_GPIO_TEST
+static void run_debug_led_gpio_test(void) {
+  while (1) {
+    DEBUG_LED_GPIO_PORT->BRR = DEBUG_LED_GPIO_PIN;
+    HAL_Delay(1000);
+    DEBUG_LED_GPIO_PORT->BSRR = DEBUG_LED_GPIO_PIN;
+    HAL_Delay(1000);
+  }
+}
+#endif
 
 static bool spa06_wait_ready(Spa06 *baro, uint8_t mask, uint32_t timeout_ms) {
   const uint32_t start = HAL_GetTick();
@@ -359,11 +368,15 @@ static void update_debug_led(void) {
   const bool request_pulse = request_count != last_led_request_count;
   if (request_pulse) {
     last_fc_request_ms = now;
+    if ((now - last_fc_flash_ms) >= 1000U) {
+      last_fc_flash_ms = now;
+      fc_flash_until_ms = now + 150U;
+    }
   }
   last_led_request_count = request_count;
   const bool recent_request = request_seen && ((now - last_fc_request_ms) < 2000U);
   const bool led_on = ((now / 500U) % 2U) == 0U;
-  const bool short_pulse = ((now / 100U) % 10U) == 0U;
+  const bool fc_flash_active = (int32_t)(fc_flash_until_ms - now) > 0;
 
   uint8_t red = 0;
   uint8_t green = 0;
@@ -381,8 +394,10 @@ static void update_debug_led(void) {
     red = led_on ? 28U : 4U;
   }
 
-  if (request_pulse || short_pulse) {
-    blue = blue > 12U ? blue : 12U;
+  if (fc_flash_active) {
+    red = 0U;
+    green = 0U;
+    blue = 24U;
   }
 
   set_debug_led(red, green, blue);
@@ -393,20 +408,29 @@ static void SystemClock_Config(void) {
   RCC_OscInitTypeDef osc = {0};
   RCC_ClkInitTypeDef clk = {0};
 
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
+
   osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   osc.HSIState = RCC_HSI_ON;
   osc.HSIDiv = RCC_HSI_DIV1;
   osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  osc.PLL.PLLState = RCC_PLL_ON;
+  osc.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  osc.PLL.PLLM = RCC_PLLM_DIV1;
+  osc.PLL.PLLN = 8;
+  osc.PLL.PLLP = RCC_PLLP_DIV2;
+  osc.PLL.PLLQ = RCC_PLLQ_DIV2;
+  osc.PLL.PLLR = RCC_PLLR_DIV2;
   if (HAL_RCC_OscConfig(&osc) != HAL_OK) {
     while (1) {
     }
   }
 
   clk.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1;
-  clk.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
   clk.APB1CLKDivider = RCC_HCLK_DIV1;
-  if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_0) != HAL_OK) {
+  if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2) != HAL_OK) {
     while (1) {
     }
   }
@@ -414,7 +438,7 @@ static void SystemClock_Config(void) {
 
 static void MX_I2C1_Init(void) {
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = I2C_TIMING_100KHZ_16MHZ;
+  hi2c1.Init.Timing = I2C_TIMING_100KHZ_64MHZ;
   hi2c1.Init.OwnAddress1 = (uint32_t)I2C_SLAVE_ADDRESS << 1;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -432,7 +456,7 @@ static void MX_I2C1_Init(void) {
 
 static void MX_I2C2_Init(void) {
   hi2c2.Instance = I2C2;
-  hi2c2.Init.Timing = I2C_TIMING_100KHZ_16MHZ;
+  hi2c2.Init.Timing = I2C_TIMING_100KHZ_64MHZ;
   hi2c2.Init.OwnAddress1 = 0;
   hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -552,7 +576,13 @@ int main(void) {
   HAL_Init();
   SystemClock_Config();
   debug_led_init();
-  set_debug_led(8, 8, 8);
+#if DEBUG_LED_GPIO_TEST
+  run_debug_led_gpio_test();
+#endif
+#if DEBUG_LED_TEST
+  run_debug_led_test();
+#endif
+  set_debug_led(0, 0, 8);
   MX_I2C2_Init();
 
   baro1.online = spa06_begin(&baro1, BARO1_I2C_ADDRESS);

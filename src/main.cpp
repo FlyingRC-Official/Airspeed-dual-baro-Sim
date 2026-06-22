@@ -112,6 +112,8 @@ uint32_t lastBarometerSampleMs = 0;
 uint32_t lastDebugLedUpdateMs = 0;
 uint32_t lastFlightControllerRequestMs = 0;
 uint32_t lastLedRequestCount = 0;
+uint32_t lastFlightControllerFlashMs = 0;
+uint32_t flightControllerFlashUntilMs = 0;
 uint32_t lastRampMs = 0;
 char commandBuffer[96] = {0};
 size_t commandLength = 0;
@@ -508,6 +510,10 @@ void updateDebugLed() {
   const bool requestPulse = requestCount != lastLedRequestCount;
   if (requestPulse) {
     lastFlightControllerRequestMs = now;
+    if (now - lastFlightControllerFlashMs >= 1000) {
+      lastFlightControllerFlashMs = now;
+      flightControllerFlashUntilMs = now + 150;
+    }
   }
   lastLedRequestCount = requestCount;
   const bool recentRequest = requestSeen && (now - lastFlightControllerRequestMs) < 2000;
@@ -517,7 +523,7 @@ void updateDebugLed() {
   uint8_t blue = 0;
 
   const bool ledOn = ((now / 500) % 2) == 0;
-  const bool shortPulse = ((now / 100) % 10) == 0;
+  const bool fcFlashActive = static_cast<int32_t>(flightControllerFlashUntilMs - now) > 0;
 
   if (!recentRequest) {
     red = ledOn ? 10 : 0;
@@ -536,8 +542,10 @@ void updateDebugLed() {
     blue = ledOn ? 24 : 3;
   }
 
-  if (requestPulse || shortPulse) {
-    blue = max<uint8_t>(blue, 12);
+  if (fcFlashActive) {
+    red = 0;
+    green = 0;
+    blue = 24;
   }
 
   setDebugLed(red, green, blue);

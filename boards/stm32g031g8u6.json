@@ -2,11 +2,17 @@
   "build": {
     "core": "stm32",
     "cpu": "cortex-m0plus",
-    "extra_flags": "-DSTM32G031xx",
+    "extra_flags": "-DSTM32G0 -DSTM32G0xx -DSTM32G031xx",
     "f_cpu": "16000000L",
+    "framework_extra_flags": {
+      "arduino": "-D__CORTEX_SC=0"
+    },
     "mcu": "stm32g031g8u6",
     "product_line": "STM32G031xx",
-    "variant": "STM32G0xx/G031G(4-6-8)U_G041G(6-8)U"
+    "variant": "STM32G0xx/G031G(4-6-8)U_G041G(6-8)U",
+    "arduino": {
+      "variant_h": "variant_generic.h"
+    }
   },
   "debug": {
     "default_tools": [
@@ -17,6 +23,8 @@
     "svd_path": "STM32G031.svd"
   },
   "frameworks": [
+    "arduino",
+    "cmsis",
     "stm32cube"
   ],
   "name": "FlyingRC STM32G031G8U6",
