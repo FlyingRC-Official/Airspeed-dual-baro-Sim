@@ -1,87 +1,272 @@
-# AirSpeed ESP32
+# FlyingRC Airspeed Dual Barometer Simulator
 
-ESP32/ESP32-S3 firmware that emulates an MS4525 differential pressure airspeed sensor as an I2C slave for ArduPilot bring-up.
+STM32G031G8U6 firmware for a dual absolute-barometer airspeed module. The board
+reads two SPA06-003 barometers, calculates the static pressure difference, and
+emulates an MS4525 differential-pressure airspeed sensor on the flight
+controller I2C bus.
 
-Version 2 can read two SPA06-003 barometers over a second I2C bus and expose their differential pressure as an MS4525-compatible airspeed sensor. If the barometers are not available, it falls back to the fake 0-100-0 km/h ramp used by V1.
+The firmware is intended for FlyingRC STM32 production hardware. It is not a
+general PC simulator. "Simulator" here means the board presents an
+MS4525-compatible I2C interface to ArduPilot, INAV, and other flight stacks that
+already support MS4525 pitot sensors.
+
+## Features
+
+- STM32G031G8U6 production firmware based on STM32Cube/HAL.
+- Dual SPA06-003 barometer input on a dedicated I2C master bus.
+- MS4525-compatible 4-byte I2C slave frame at address `0x28`.
+- Startup zero-offset calibration for the barometer pressure difference.
+- Append-only Flash storage for calibration records with CRC32 validation.
+- WS2812 status LED output for factory and field diagnosis.
+- PWLINK2/CMSIS-DAP batch flashing page with calibration readback.
+- ST-Link upload target for development.
+
+## Repository Scope
+
+This repository contains the STM32 hardware firmware and supporting production
+tools only.
+
+Main files:
+
+| Path | Purpose |
+| --- | --- |
+| `src/stm32/main.c` | STM32G031 firmware, SPA06 driver, MS4525 emulation, Flash calibration |
+| `src/stm32/ws2812.c` | WS2812 debug LED driver |
+| `boards/stm32g031g8u6.json` | PlatformIO board definition |
+| `stm32g031g8u6_app.ld` | Application linker script, leaving the last 4 KB for calibration |
+| `platformio.ini` | Build, upload, and test environments |
+| `tools/pwlink2_flash_ui.py` | Local batch flashing and calibration readback web UI |
 
 ## Hardware Defaults
 
-- Primary target: ESP32-S3 DevKitC, PlatformIO env `esp32-s3-devkitc-1`
-- Fallback target: classic ESP32 DevKit, PlatformIO env `esp32dev`
-- Experimental STM32 target: STM32G031G8U6, PlatformIO env `stm32g031g8u6`
-- I2C slave address: `0x28`
-- ESP32-S3 flight-controller I2C slave pins: SDA `GPIO8`, SCL `GPIO9`
-- ESP32-S3 barometer I2C master pins: SDA `GPIO4`, SCL `GPIO5`
-- ESP32-S3 WS2812 debug LED pin: `GPIO48`
-- Classic ESP32 flight-controller I2C slave pins: SDA `GPIO21`, SCL `GPIO22`
-- Classic ESP32 barometer I2C master pins: SDA `GPIO4`, SCL `GPIO5`
-- STM32G031G8U6 flight-controller I2C slave pins: I2C1 SCL `PB6`, SDA `PB7`
-- STM32G031G8U6 barometer I2C master pins: I2C2 SCL `PA11`, SDA `PA12`
-- STM32G031G8U6 WS2812 debug LED pin: `PA8` by default
-- Barometer 1 address: `0x76`
-- Barometer 2 address: `0x77`
-- Serial monitor: `115200`
+| Function | Default |
+| --- | --- |
+| MCU | STM32G031G8U6 |
+| Flight-controller I2C address | `0x28` |
+| Flight-controller I2C pins | I2C1 SCL `PB6`, SDA `PB7` |
+| Barometer I2C pins | I2C2 SCL `PA11`, SDA `PA12` |
+| Barometer 1 address | `0x76` |
+| Barometer 2 address | `0x77` |
+| WS2812 debug LED | `PA8` |
+| MS4525 pressure range | `1.0 psi` |
 
-Connect SDA, SCL, and GND to the flight controller I2C bus. Use 3.3 V-compatible pullups.
+Connect SDA, SCL, and GND from the flight controller to the flight-controller
+I2C bus. Use 3.3 V-compatible pullups. Connect both SPA06-003 sensors to the
+barometer I2C bus and set one sensor to `0x76` and the other to `0x77`.
 
-Connect both SPA06-003 barometers to the barometer I2C bus. Put one sensor at `0x76` and the other at `0x77`.
+## How It Works
 
-The WS2812 debug LED shows firmware state:
+1. At boot, the STM32 initializes I2C1 as an MS4525-compatible I2C slave and
+   I2C2 as the SPA06 barometer master bus.
+2. The firmware reads both SPA06-003 sensors continuously.
+3. The signed pressure difference is calculated as:
 
-- Purple blink: waiting for flight-controller I2C reads
-- Green heartbeat: using live dual-barometer differential pressure
-- Red/orange heartbeat: barometer input enabled but not fully healthy
-- Amber heartbeat: fallback fake ramp is active
-- Blue heartbeat: manual/static pressure mode
+   ```text
+   diff_pa = BARO_DIFF_SIGN * (baro1_pressure_pa - baro2_pressure_pa)
+   output_pa = diff_pa - diff_offset_pa
+   ```
+
+4. `output_pa` is encoded into the standard MS4525 4-byte pressure and
+   temperature frame.
+5. The flight controller sees a normal MS4525 airspeed sensor on I2C address
+   `0x28`.
+
+The pressure sign can be changed at build time with `BARO_DIFF_SIGN`.
+
+## Calibration Storage
+
+The firmware reserves the last two 2 KB Flash pages for calibration:
+
+| Page | Address Range |
+| --- | --- |
+| Page 0 | `0x0800F000` to `0x0800F7FF` |
+| Page 1 | `0x0800F800` to `0x0800FFFF` |
+
+Calibration records are append-only. At boot, the firmware scans both pages,
+checks the magic value and CRC32, and loads the valid record with the highest
+sequence number.
+
+If a valid record is found, the saved `diff_offset_pa` is used immediately. If
+no valid record is found, the board must remain still at power-up. The firmware
+captures about 3 seconds of dual-barometer samples, requires at least 32 samples
+and standard deviation no higher than 5 Pa, writes one Flash record, and then
+uses that offset.
+
+The linker script limits the application image to the first 60 KB of Flash, so
+normal firmware uploads do not overwrite the calibration pages. A full-chip
+erase or explicit erase of `0x0800F000` to `0x0800FFFF` will remove the saved
+calibration.
+
+## LED Status
+
+| LED State | Meaning |
+| --- | --- |
+| Purple blink | Waiting for flight-controller I2C reads |
+| Green heartbeat | Both barometers are healthy and live differential pressure is used |
+| Red/orange heartbeat | Partial or degraded barometer input |
+| Red heartbeat | No usable barometer input |
+| Blue flash | Flight-controller I2C read activity |
+
+## Prerequisites
+
+- PlatformIO Core.
+- STM32 PlatformIO platform packages.
+- PWLINK2 or another CMSIS-DAP probe for the production upload target.
+- ST-Link for the alternate development upload target.
+- Python 3 for the batch flashing UI.
+
+The batch UI finds tools in this order: command-line argument, environment
+variable, `PATH`, then the default PlatformIO package location under
+`~/.platformio`.
+
+Override tool paths when needed:
+
+```sh
+PIO=/path/to/pio python3 tools/pwlink2_flash_ui.py
+python3 tools/pwlink2_flash_ui.py --pio /path/to/pio
+python3 tools/pwlink2_flash_ui.py --openocd /path/to/openocd --openocd-scripts /path/to/scripts
+```
 
 ## Build
 
-```sh
-pio run -e esp32-s3-devkitc-1
-```
-
-Fallback classic ESP32 build:
+Production PWLINK2/CMSIS-DAP build:
 
 ```sh
-pio run -e esp32dev
+pio run -e stm32g031g8u6-pwlink2
 ```
 
-Experimental STM32G031G8U6 build:
+ST-Link development build:
 
 ```sh
 pio run -e stm32g031g8u6
 ```
 
-The STM32G031G8U6 port is a lean STM32Cube/HAL firmware. It keeps the MS4525 I2C slave, dual SPA06 barometer input, startup auto-zero, and WS2812 state LED, but does not include the ESP32 serial command interface.
-
-## Upload And Monitor
+LED and GPIO test builds:
 
 ```sh
-pio run -e esp32-s3-devkitc-1 -t upload
-pio device monitor -b 115200
+pio run -e stm32g031g8u6-pwlink2-ledtest
+pio run -e stm32g031g8u6-pwlink2-gpiotest
+pio run -e stm32g031g8u6-pwlink2-arduino-ledtest
 ```
 
-If the monitor prints `waiting for download`, the ESP32-S3 is in ROM download mode. Press reset on the board or run:
+## Upload
+
+Upload with PWLINK2/CMSIS-DAP:
 
 ```sh
-python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem101 run
+pio run -e stm32g031g8u6-pwlink2 -t upload
 ```
 
-## Serial Commands
+Upload with ST-Link:
 
-- `p <pa>`: set fake differential pressure in Pascals
-- `t <c>`: set fake temperature in Celsius
-- `z`: set pressure to zero
-- `r on`: enable the fake airspeed ramp
-- `r off`: disable the pressure ramp
-- `b on`: enable real dual-barometer input
-- `b off`: disable real dual-barometer input
-- `c`: zero the current barometer differential pressure
-- `s`: print current state and raw MS4525 frame bytes
-- `h`: print help
+```sh
+pio run -e stm32g031g8u6 -t upload
+```
 
-Default boot state enables real barometers. The firmware automatically zeroes the first valid barometer differential pressure reading. If either barometer is missing, it falls back to the fake ramp, which rises from `0 km/h` to `100 km/h` in 10 seconds, then falls from `100 km/h` to `0 km/h` in 10 seconds, repeating continuously.
+## Batch Flashing With PWLINK2
+
+Start the local production page:
+
+```sh
+python3 tools/pwlink2_flash_ui.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8765
+```
+
+Default behavior is unlimited batch mode. Move the pogo pins to the current
+board, keep the board still, and click the flash button. The page uploads the
+firmware, waits for startup calibration, dumps the calibration Flash area, and
+records:
+
+- Result.
+- `offset Pa`.
+- `stddev Pa`.
+- Sample count.
+- Mean temperature.
+- Calibration dump path.
+
+Use a fixed count only when required:
+
+```sh
+python3 tools/pwlink2_flash_ui.py --count 12
+```
+
+The normal flash button preserves existing calibration records. Use
+`Retry and recalibrate current board` when a board must be recalibrated. That
+flow erases `0x0800F000` to `0x0800FFFF` first, then uploads the firmware and
+waits for a fresh calibration record.
+
+## Factory Calibration Guidance
+
+During first power-up or forced recalibration:
+
+1. Keep the board mechanically still.
+2. Avoid airflow across either barometer port.
+3. Wait at least 3 to 5 seconds after reset.
+4. Check the UI readback.
+
+Suggested production checks:
+
+| Check | Typical Result | Action |
+| --- | --- | --- |
+| `stddev Pa` | `0.3` to `1.0` | Good fixture stability |
+| `abs(offset Pa)` | `0` to `8` | Normal |
+| `abs(offset Pa)` | `8` to `15` | Usable, mark and observe |
+| `abs(offset Pa)` | `> 20` | Recheck assembly, leakage, port stress, or sensor damage |
+
+If `stddev Pa` is low but a board repeatedly calibrates near the same larger
+offset, the value is likely a real sensor or assembly offset rather than noise.
+The saved offset compensates it, but the board should be tracked as a boundary
+sample for production consistency.
+
+After calibration, static airspeed reported by the flight controller should
+normally be below about `1` to `2 m/s` when the board is still and protected from
+airflow.
 
 ## ArduPilot Setup
 
-Set `ARSPD_TYPE=1` for `I2C-MS4525D0`. Leave bus autodetection enabled first; set `ARSPD_BUS` only if autodetect fails. Reboot the flight controller and check the GCS messages for an MS4525 found message. Then use `p <pa>` in the ESP32 serial monitor and confirm ArduPilot telemetry changes.
+Use the MS4525 driver:
+
+```text
+ARSPD_TYPE = 1
+```
+
+Leave bus autodetection enabled first. Set `ARSPD_BUS` only if autodetection
+does not find the sensor. Reboot the flight controller and confirm that the GCS
+reports an MS4525 airspeed sensor.
+
+ArduPilot performs its own airspeed offset handling at the flight-controller
+level. The STM32 board also stores its local dual-barometer static pressure
+offset, so the flight controller receives an already zeroed MS4525-style
+differential-pressure frame.
+
+## INAV Setup
+
+Select the MS4525 pitot/airspeed sensor type. Keep the airspeed module still and
+shielded from airflow during INAV's initial pitot calibration window.
+
+INAV performs calibration inside the flight controller. The STM32 board does not
+need a special I2C calibration command from INAV; it exposes a normal
+MS4525-compatible sensor frame.
+
+## Build-Time Options
+
+The main options are set in `platformio.ini`:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `I2C_SLAVE_ADDRESS` | `0x28` | MS4525-compatible slave address |
+| `MS4525_PSI_RANGE` | `1.0f` | Encoded pressure range |
+| `BARO1_I2C_ADDRESS` | `0x76` | First SPA06 address |
+| `BARO2_I2C_ADDRESS` | `0x77` | Second SPA06 address |
+| `BARO_DIFF_SIGN` | `1` | Pressure-difference polarity |
+| `BARO_AUTOZERO` | `1` | Startup local zero handling |
+| `DEBUG_LED_ENABLED` | `1` | WS2812 status LED |
+
+## License
+
+MIT License. See `LICENSE`.

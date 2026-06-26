@@ -65,6 +65,16 @@
 #define I2C_TIMING_100KHZ_64MHZ 0x30303D5BU
 #define MS4525_FRAME_LEN 4U
 
+#define CAL_FLASH_PAGE_SIZE 0x800U
+#define CAL_FLASH_PAGE0_ADDR 0x0800F000U
+#define CAL_FLASH_PAGE1_ADDR 0x0800F800U
+#define CAL_FLASH_END_ADDR 0x08010000U
+#define CAL_RECORD_MAGIC 0x46524153U
+#define CAL_RECORD_VERSION 1U
+#define CAL_CAPTURE_MS 3000U
+#define CAL_MIN_SAMPLES 32U
+#define CAL_MAX_STDDEV_PA 5.0f
+
 typedef struct {
   int16_t c0;
   int16_t c1;
@@ -85,6 +95,24 @@ typedef struct {
   uint32_t updated_ms;
 } Spa06;
 
+typedef struct {
+  uint16_t version;
+  uint16_t length;
+  uint32_t sequence;
+  float diff_offset_pa;
+  float baro1_mean_pa;
+  float baro2_mean_pa;
+  float temperature_mean_c;
+  float diff_stddev_pa;
+  uint32_t sample_count;
+  uint32_t flags;
+  uint32_t reserved;
+  uint32_t crc32;
+  uint32_t magic;
+} AirspeedCalRecord;
+
+typedef char cal_record_must_be_doubleword_aligned[(sizeof(AirspeedCalRecord) % 8U) == 0U ? 1 : -1];
+
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 
@@ -101,6 +129,13 @@ static float pressure_pa = 0.0f;
 static float temperature_c = 25.0f;
 static float diff_offset_pa = 0.0f;
 static bool offset_valid = false;
+static uint32_t startup_cal_start_ms = 0;
+static uint32_t startup_cal_count = 0;
+static float startup_cal_diff_sum = 0.0f;
+static float startup_cal_diff_sq_sum = 0.0f;
+static float startup_cal_baro1_sum = 0.0f;
+static float startup_cal_baro2_sum = 0.0f;
+static float startup_cal_temp_sum = 0.0f;
 static uint32_t last_led_update_ms = 0;
 static uint32_t last_fc_request_ms = 0;
 static uint32_t last_led_request_count = 0;
@@ -139,6 +174,261 @@ static int16_t clamp_i16(float value, int16_t low, int16_t high) {
     return high;
   }
   return (int16_t)(value >= 0.0f ? value + 0.5f : value - 0.5f);
+}
+
+static float sqrt_approx(float value) {
+  if (value <= 0.0f) {
+    return 0.0f;
+  }
+
+  float x = value;
+  for (uint32_t i = 0; i < 6U; i++) {
+    x = 0.5f * (x + (value / x));
+  }
+  return x;
+}
+
+static uint32_t crc32_update(uint32_t crc, uint8_t data) {
+  crc ^= data;
+  for (uint32_t bit = 0; bit < 8U; bit++) {
+    crc = (crc >> 1) ^ (0xEDB88320U & (0U - (crc & 1U)));
+  }
+  return crc;
+}
+
+static uint32_t crc32_calc(const void *data, uint32_t length) {
+  const uint8_t *bytes = (const uint8_t *)data;
+  uint32_t crc = 0xFFFFFFFFU;
+  for (uint32_t i = 0; i < length; i++) {
+    crc = crc32_update(crc, bytes[i]);
+  }
+  return crc ^ 0xFFFFFFFFU;
+}
+
+static bool cal_record_slot_empty(uint32_t address) {
+  const uint32_t *word = (const uint32_t *)address;
+  for (uint32_t i = 0; i < (sizeof(AirspeedCalRecord) / 4U); i++) {
+    if (word[i] != 0xFFFFFFFFU) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool cal_record_valid(const AirspeedCalRecord *record) {
+  if (record->magic != CAL_RECORD_MAGIC ||
+      record->version != CAL_RECORD_VERSION ||
+      record->length != sizeof(AirspeedCalRecord) ||
+      record->sample_count == 0U ||
+      record->diff_offset_pa < -10000.0f ||
+      record->diff_offset_pa > 10000.0f) {
+    return false;
+  }
+
+  const uint32_t crc = crc32_calc(record, sizeof(AirspeedCalRecord) - 8U);
+  return crc == record->crc32;
+}
+
+static uint32_t cal_page_start(uint32_t address) {
+  return (address >= CAL_FLASH_PAGE1_ADDR) ? CAL_FLASH_PAGE1_ADDR : CAL_FLASH_PAGE0_ADDR;
+}
+
+static uint32_t cal_other_page(uint32_t page_start) {
+  return (page_start == CAL_FLASH_PAGE0_ADDR) ? CAL_FLASH_PAGE1_ADDR : CAL_FLASH_PAGE0_ADDR;
+}
+
+static bool cal_find_empty_slot(uint32_t page_start, uint32_t *empty_addr) {
+  const uint32_t page_end = page_start + CAL_FLASH_PAGE_SIZE;
+  for (uint32_t addr = page_start; addr + sizeof(AirspeedCalRecord) <= page_end;
+       addr += sizeof(AirspeedCalRecord)) {
+    if (cal_record_slot_empty(addr)) {
+      *empty_addr = addr;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool cal_find_latest_record(const AirspeedCalRecord **record, uint32_t *record_addr) {
+  const AirspeedCalRecord *best = NULL;
+  uint32_t best_addr = 0U;
+
+  for (uint32_t addr = CAL_FLASH_PAGE0_ADDR; addr + sizeof(AirspeedCalRecord) <= CAL_FLASH_END_ADDR;
+       addr += sizeof(AirspeedCalRecord)) {
+    const AirspeedCalRecord *candidate = (const AirspeedCalRecord *)addr;
+    if (!cal_record_valid(candidate)) {
+      continue;
+    }
+    if (best == NULL || candidate->sequence > best->sequence) {
+      best = candidate;
+      best_addr = addr;
+    }
+  }
+
+  if (best == NULL) {
+    return false;
+  }
+
+  *record = best;
+  *record_addr = best_addr;
+  return true;
+}
+
+static bool cal_erase_page(uint32_t page_start) {
+  FLASH_EraseInitTypeDef erase = {0};
+  uint32_t page_error = 0U;
+
+  erase.TypeErase = FLASH_TYPEERASE_PAGES;
+  erase.Page = (page_start - FLASH_BASE) / FLASH_PAGE_SIZE;
+  erase.NbPages = 1U;
+
+  return HAL_FLASHEx_Erase(&erase, &page_error) == HAL_OK;
+}
+
+static bool cal_program_record(uint32_t address, const AirspeedCalRecord *record) {
+  const uint32_t *word = (const uint32_t *)record;
+  const uint32_t word_count = sizeof(AirspeedCalRecord) / 4U;
+
+  for (uint32_t i = 0; i < word_count - 2U; i += 2U) {
+    const uint64_t doubleword = (uint64_t)word[i] | ((uint64_t)word[i + 1U] << 32);
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, address + (i * 4U), doubleword) != HAL_OK) {
+      return false;
+    }
+  }
+
+  const uint64_t commit_doubleword =
+      (uint64_t)word[word_count - 2U] | ((uint64_t)word[word_count - 1U] << 32);
+  return HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                           address + ((word_count - 2U) * 4U),
+                           commit_doubleword) == HAL_OK;
+}
+
+static bool cal_save_record(float offset_pa,
+                            float baro1_mean_pa,
+                            float baro2_mean_pa,
+                            float temp_mean_c,
+                            float diff_stddev_pa,
+                            uint32_t sample_count) {
+  const AirspeedCalRecord *latest = NULL;
+  uint32_t latest_addr = 0U;
+  const bool have_latest = cal_find_latest_record(&latest, &latest_addr);
+  const uint32_t active_page = have_latest ? cal_page_start(latest_addr) : CAL_FLASH_PAGE0_ADDR;
+  uint32_t write_addr = 0U;
+  bool erase_old_page_after_write = false;
+  const uint32_t old_page = active_page;
+
+  if (!cal_find_empty_slot(active_page, &write_addr)) {
+    const uint32_t target_page = cal_other_page(active_page);
+    if (HAL_FLASH_Unlock() != HAL_OK) {
+      return false;
+    }
+    if (!cal_erase_page(target_page)) {
+      HAL_FLASH_Lock();
+      return false;
+    }
+    HAL_FLASH_Lock();
+    write_addr = target_page;
+    erase_old_page_after_write = true;
+  }
+
+  AirspeedCalRecord record = {
+      .version = CAL_RECORD_VERSION,
+      .length = sizeof(AirspeedCalRecord),
+      .sequence = have_latest ? latest->sequence + 1U : 1U,
+      .diff_offset_pa = offset_pa,
+      .baro1_mean_pa = baro1_mean_pa,
+      .baro2_mean_pa = baro2_mean_pa,
+      .temperature_mean_c = temp_mean_c,
+      .diff_stddev_pa = diff_stddev_pa,
+      .sample_count = sample_count,
+      .flags = 0U,
+      .reserved = 0U,
+      .crc32 = 0U,
+      .magic = CAL_RECORD_MAGIC,
+  };
+  record.crc32 = crc32_calc(&record, sizeof(AirspeedCalRecord) - 8U);
+
+  if (HAL_FLASH_Unlock() != HAL_OK) {
+    return false;
+  }
+
+  const bool programmed = cal_program_record(write_addr, &record);
+  const bool verified = programmed && cal_record_valid((const AirspeedCalRecord *)write_addr);
+
+  if (verified && erase_old_page_after_write) {
+    (void)cal_erase_page(old_page);
+  }
+
+  HAL_FLASH_Lock();
+  return verified;
+}
+
+static void cal_load_flash_offset(void) {
+  const AirspeedCalRecord *record = NULL;
+  uint32_t record_addr = 0U;
+  if (!cal_find_latest_record(&record, &record_addr)) {
+    return;
+  }
+
+  (void)record_addr;
+  diff_offset_pa = record->diff_offset_pa;
+  offset_valid = true;
+}
+
+static void startup_cal_reset(uint32_t now) {
+  startup_cal_start_ms = now;
+  startup_cal_count = 0U;
+  startup_cal_diff_sum = 0.0f;
+  startup_cal_diff_sq_sum = 0.0f;
+  startup_cal_baro1_sum = 0.0f;
+  startup_cal_baro2_sum = 0.0f;
+  startup_cal_temp_sum = 0.0f;
+}
+
+static void startup_cal_add_sample(float signed_diff, float baro1_pa, float baro2_pa, float temp_c) {
+  startup_cal_count++;
+  startup_cal_diff_sum += signed_diff;
+  startup_cal_diff_sq_sum += signed_diff * signed_diff;
+  startup_cal_baro1_sum += baro1_pa;
+  startup_cal_baro2_sum += baro2_pa;
+  startup_cal_temp_sum += temp_c;
+}
+
+static bool startup_cal_finish_if_ready(uint32_t now) {
+  if (startup_cal_start_ms == 0U) {
+    startup_cal_reset(now);
+    return false;
+  }
+
+  if ((now - startup_cal_start_ms) < CAL_CAPTURE_MS || startup_cal_count < CAL_MIN_SAMPLES) {
+    return false;
+  }
+
+  const float count = (float)startup_cal_count;
+  const float mean = startup_cal_diff_sum / count;
+  float variance = (startup_cal_diff_sq_sum / count) - (mean * mean);
+  if (variance < 0.0f) {
+    variance = 0.0f;
+  }
+  const float stddev = sqrt_approx(variance);
+
+  if (stddev > CAL_MAX_STDDEV_PA) {
+    startup_cal_reset(now);
+    return false;
+  }
+
+  diff_offset_pa = mean;
+  offset_valid = true;
+  const bool saved = cal_save_record(mean,
+                                     startup_cal_baro1_sum / count,
+                                     startup_cal_baro2_sum / count,
+                                     startup_cal_temp_sum / count,
+                                     stddev,
+                                     startup_cal_count);
+  if (!saved) {
+    startup_cal_reset(now);
+  }
+  return offset_valid;
 }
 
 static bool i2c_mem_read(I2C_HandleTypeDef *i2c, uint8_t address, uint8_t reg, uint8_t *data, uint16_t len) {
@@ -347,8 +637,14 @@ static void update_barometers(void) {
   const float signed_diff = (baro1.pressure_pa - baro2.pressure_pa) * (float)BARO_DIFF_SIGN;
 #if BARO_AUTOZERO
   if (!offset_valid) {
-    diff_offset_pa = signed_diff;
-    offset_valid = true;
+    const float avg_temp_c = (baro1.temperature_c + baro2.temperature_c) * 0.5f;
+    startup_cal_add_sample(signed_diff, baro1.pressure_pa, baro2.pressure_pa, avg_temp_c);
+    if (!startup_cal_finish_if_ready(now)) {
+      pressure_pa = 0.0f;
+      temperature_c = avg_temp_c;
+      update_response_frame();
+      return;
+    }
   }
 #endif
   pressure_pa = signed_diff - diff_offset_pa;
@@ -587,6 +883,7 @@ int main(void) {
 
   baro1.online = spa06_begin(&baro1, BARO1_I2C_ADDRESS);
   baro2.online = spa06_begin(&baro2, BARO2_I2C_ADDRESS);
+  cal_load_flash_offset();
   update_response_frame();
 
   MX_I2C1_Init();
