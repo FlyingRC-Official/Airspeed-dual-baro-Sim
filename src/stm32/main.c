@@ -28,6 +28,22 @@
 #define BARO_AUTOZERO 1
 #endif
 
+#ifndef VIRTUAL_DPS310_ENABLED
+#define VIRTUAL_DPS310_ENABLED 1
+#endif
+
+#ifndef VIRTUAL_DPS310_I2C_ADDRESS
+#define VIRTUAL_DPS310_I2C_ADDRESS 0x77
+#endif
+
+#ifndef STATIC_DETECT_MIN_DIFF_PA
+#define STATIC_DETECT_MIN_DIFF_PA 20.0f
+#endif
+
+#ifndef STATIC_DETECT_LOCK_SAMPLES
+#define STATIC_DETECT_LOCK_SAMPLES 10U
+#endif
+
 #ifndef DEBUG_LED_ENABLED
 #define DEBUG_LED_ENABLED 0
 #endif
@@ -64,6 +80,33 @@
 
 #define I2C_TIMING_100KHZ_64MHZ 0x30303D5BU
 #define MS4525_FRAME_LEN 4U
+
+#if VIRTUAL_DPS310_ENABLED
+#define DPS310_REG_PRESSURE 0x00
+#define DPS310_REG_TEMPERATURE 0x03
+#define DPS310_REG_PRESSURE_CONFIG 0x06
+#define DPS310_REG_TEMPERATURE_CONFIG 0x07
+#define DPS310_REG_MEASURE_CONFIG 0x08
+#define DPS310_REG_CONFIG 0x09
+#define DPS310_REG_RESET 0x0C
+#define DPS310_REG_ID 0x0D
+#define DPS310_REG_COEF 0x10
+#define DPS310_REG_COEF_SRCE 0x28
+#define DPS310_EXPECTED_ID 0x10
+#define DPS310_COEF_LEN 18U
+#define DPS310_DATA_LEN 6U
+#define DPS310_SCALE_16X 253952.0f
+#define DPS310_READY_STATUS 0xF0U
+#define DPS310_MEAS_CTRL_MASK 0x07U
+#define DPS310_RESET_COMMAND 0x09U
+#define DPS310_COEF_SRCE_TMP_EXT 0x80U
+#define DPS310_SYNTH_C00_PA 100000.0f
+#define DPS310_SYNTH_C10_PA 2500.0f
+#define DPS310_SYNTH_C1_TEMP 100.0f
+#define STATIC_SOURCE_UNKNOWN 0U
+#define STATIC_SOURCE_BARO1 1U
+#define STATIC_SOURCE_BARO2 2U
+#endif
 
 #define CAL_FLASH_PAGE_SIZE 0x800U
 #define CAL_FLASH_PAGE0_ADDR 0x0800F000U
@@ -121,9 +164,17 @@ static Spa06 baro2 = {.address = BARO2_I2C_ADDRESS};
 
 static volatile uint8_t response_frame[MS4525_FRAME_LEN] = {0};
 static uint8_t tx_frame[MS4525_FRAME_LEN] = {0};
-static uint8_t rx_byte = 0;
 static volatile uint32_t request_count = 0;
 static volatile uint32_t receive_count = 0;
+
+typedef enum {
+  I2C1_SLAVE_NONE = 0,
+  I2C1_SLAVE_MS4525,
+  I2C1_SLAVE_DPS310
+} I2c1SlaveDevice;
+
+static volatile I2c1SlaveDevice i2c1_active_slave = I2C1_SLAVE_NONE;
+static volatile uint8_t i2c1_ms4525_tx_index = 0;
 
 static float pressure_pa = 0.0f;
 static float temperature_c = 25.0f;
@@ -141,6 +192,24 @@ static uint32_t last_fc_request_ms = 0;
 static uint32_t last_led_request_count = 0;
 static uint32_t last_fc_flash_ms = 0;
 static uint32_t fc_flash_until_ms = 0;
+
+#if VIRTUAL_DPS310_ENABLED
+static const uint8_t dps310_coefficients[DPS310_COEF_LEN] = {
+    0x00, 0x00, 0x64, 0x18, 0x6A, 0x00, 0x09, 0xC4, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+static volatile uint8_t dps310_data_frame[DPS310_DATA_LEN] = {0};
+static volatile uint8_t dps310_reg_pointer = DPS310_REG_ID;
+static volatile uint8_t dps310_rx_count = 0;
+static volatile uint8_t dps310_pressure_config = 0;
+static volatile uint8_t dps310_temperature_config = 0;
+static volatile uint8_t dps310_measure_config = 0;
+static volatile uint8_t dps310_config = 0;
+static volatile uint8_t dps310_reset = 0;
+static uint8_t static_pressure_source = STATIC_SOURCE_UNKNOWN;
+static uint8_t static_pressure_candidate = STATIC_SOURCE_UNKNOWN;
+static uint32_t static_pressure_candidate_count = 0;
+#endif
 
 static int16_t sign_extend_12(uint16_t value) {
   value &= 0x0FFFU;
@@ -174,6 +243,20 @@ static int16_t clamp_i16(float value, int16_t low, int16_t high) {
     return high;
   }
   return (int16_t)(value >= 0.0f ? value + 0.5f : value - 0.5f);
+}
+
+static int32_t clamp_i32(float value, int32_t low, int32_t high) {
+  if (value < (float)low) {
+    return low;
+  }
+  if (value > (float)high) {
+    return high;
+  }
+  return (int32_t)(value >= 0.0f ? value + 0.5f : value - 0.5f);
+}
+
+static float abs_float(float value) {
+  return (value < 0.0f) ? -value : value;
 }
 
 static float sqrt_approx(float value) {
@@ -620,6 +703,169 @@ static void update_response_frame(void) {
   __enable_irq();
 }
 
+#if VIRTUAL_DPS310_ENABLED
+static void dps310_reset_registers(void) {
+  dps310_pressure_config = 0;
+  dps310_temperature_config = 0;
+  dps310_measure_config = 0;
+  dps310_config = 0;
+  dps310_reset = 0;
+}
+
+static uint8_t dps310_read_register(uint8_t reg) {
+  if (reg < DPS310_DATA_LEN) {
+    return dps310_data_frame[reg];
+  }
+
+  if (reg >= DPS310_REG_COEF && reg < (DPS310_REG_COEF + DPS310_COEF_LEN)) {
+    return dps310_coefficients[reg - DPS310_REG_COEF];
+  }
+
+  switch (reg) {
+    case DPS310_REG_PRESSURE_CONFIG:
+      return dps310_pressure_config;
+    case DPS310_REG_TEMPERATURE_CONFIG:
+      return dps310_temperature_config;
+    case DPS310_REG_MEASURE_CONFIG:
+      return (uint8_t)(DPS310_READY_STATUS | (dps310_measure_config & DPS310_MEAS_CTRL_MASK));
+    case DPS310_REG_CONFIG:
+      return dps310_config;
+    case DPS310_REG_RESET:
+      return dps310_reset;
+    case DPS310_REG_ID:
+      return DPS310_EXPECTED_ID;
+    case DPS310_REG_COEF_SRCE:
+      return DPS310_COEF_SRCE_TMP_EXT;
+    default:
+      return 0;
+  }
+}
+
+static void dps310_write_register(uint8_t reg, uint8_t value) {
+  switch (reg) {
+    case DPS310_REG_PRESSURE_CONFIG:
+      dps310_pressure_config = value;
+      break;
+    case DPS310_REG_TEMPERATURE_CONFIG:
+      dps310_temperature_config = value;
+      break;
+    case DPS310_REG_MEASURE_CONFIG:
+      dps310_measure_config = (uint8_t)(value & DPS310_MEAS_CTRL_MASK);
+      break;
+    case DPS310_REG_CONFIG:
+      dps310_config = value;
+      break;
+    case DPS310_REG_RESET:
+      dps310_reset = value;
+      if (value == DPS310_RESET_COMMAND) {
+        dps310_reset_registers();
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+static void update_static_pressure_source(void) {
+  if (static_pressure_source != STATIC_SOURCE_UNKNOWN || !baro1.valid || !baro2.valid) {
+    return;
+  }
+
+#if BARO_AUTOZERO
+  if (!offset_valid) {
+    static_pressure_candidate = STATIC_SOURCE_UNKNOWN;
+    static_pressure_candidate_count = 0;
+    return;
+  }
+#endif
+
+  const float raw_diff_pa = baro1.pressure_pa - baro2.pressure_pa;
+  const float raw_offset_pa = diff_offset_pa / (float)BARO_DIFF_SIGN;
+  const float corrected_diff_pa = raw_diff_pa - raw_offset_pa;
+  if (abs_float(corrected_diff_pa) < STATIC_DETECT_MIN_DIFF_PA) {
+    static_pressure_candidate = STATIC_SOURCE_UNKNOWN;
+    static_pressure_candidate_count = 0;
+    return;
+  }
+
+  const uint8_t candidate = (corrected_diff_pa <= 0.0f) ? STATIC_SOURCE_BARO1 : STATIC_SOURCE_BARO2;
+  if (candidate == static_pressure_candidate) {
+    static_pressure_candidate_count++;
+  } else {
+    static_pressure_candidate = candidate;
+    static_pressure_candidate_count = 1;
+  }
+
+  if (static_pressure_candidate_count >= STATIC_DETECT_LOCK_SAMPLES) {
+    static_pressure_source = static_pressure_candidate;
+  }
+}
+
+static float virtual_static_pressure_pa(void) {
+  if (static_pressure_source == STATIC_SOURCE_BARO1 && baro1.valid) {
+    return baro1.pressure_pa;
+  }
+  if (static_pressure_source == STATIC_SOURCE_BARO2 && baro2.valid) {
+    return baro2.pressure_pa;
+  }
+  if (baro1.valid && baro2.valid) {
+    return (baro1.pressure_pa + baro2.pressure_pa) * 0.5f;
+  }
+  if (baro1.valid) {
+    return baro1.pressure_pa;
+  }
+  if (baro2.valid) {
+    return baro2.pressure_pa;
+  }
+  return DPS310_SYNTH_C00_PA;
+}
+
+static float virtual_static_temperature_c(void) {
+  if (static_pressure_source == STATIC_SOURCE_BARO1 && baro1.valid) {
+    return baro1.temperature_c;
+  }
+  if (static_pressure_source == STATIC_SOURCE_BARO2 && baro2.valid) {
+    return baro2.temperature_c;
+  }
+  if (baro1.valid && baro2.valid) {
+    return (baro1.temperature_c + baro2.temperature_c) * 0.5f;
+  }
+  if (baro1.valid) {
+    return baro1.temperature_c;
+  }
+  if (baro2.valid) {
+    return baro2.temperature_c;
+  }
+  return 25.0f;
+}
+
+static void update_virtual_dps310_frame(void) {
+  uint8_t frame[DPS310_DATA_LEN] = {0};
+  const float static_pressure_pa = virtual_static_pressure_pa();
+  const float static_temperature_c = virtual_static_temperature_c();
+  const int32_t pressure_raw =
+      clamp_i32(((static_pressure_pa - DPS310_SYNTH_C00_PA) / DPS310_SYNTH_C10_PA) * DPS310_SCALE_16X,
+                -8388608, 8388607);
+  const int32_t temperature_raw =
+      clamp_i32((static_temperature_c / DPS310_SYNTH_C1_TEMP) * DPS310_SCALE_16X, -8388608, 8388607);
+  const uint32_t pressure_bits = (uint32_t)pressure_raw & 0x00FFFFFFU;
+  const uint32_t temperature_bits = (uint32_t)temperature_raw & 0x00FFFFFFU;
+
+  frame[0] = (uint8_t)(pressure_bits >> 16);
+  frame[1] = (uint8_t)(pressure_bits >> 8);
+  frame[2] = (uint8_t)pressure_bits;
+  frame[3] = (uint8_t)(temperature_bits >> 16);
+  frame[4] = (uint8_t)(temperature_bits >> 8);
+  frame[5] = (uint8_t)temperature_bits;
+
+  __disable_irq();
+  for (uint32_t i = 0; i < DPS310_DATA_LEN; i++) {
+    dps310_data_frame[i] = frame[i];
+  }
+  __enable_irq();
+}
+#endif
+
 static void update_barometers(void) {
   static uint32_t last_sample_ms = 0;
   const uint32_t now = HAL_GetTick();
@@ -631,8 +877,16 @@ static void update_barometers(void) {
   if (!spa06_read(&baro1) || !spa06_read(&baro2)) {
     pressure_pa = 0.0f;
     update_response_frame();
+#if VIRTUAL_DPS310_ENABLED
+    update_virtual_dps310_frame();
+#endif
     return;
   }
+
+#if VIRTUAL_DPS310_ENABLED
+  update_static_pressure_source();
+  update_virtual_dps310_frame();
+#endif
 
   const float signed_diff = (baro1.pressure_pa - baro2.pressure_pa) * (float)BARO_DIFF_SIGN;
 #if BARO_AUTOZERO
@@ -737,8 +991,13 @@ static void MX_I2C1_Init(void) {
   hi2c1.Init.Timing = I2C_TIMING_100KHZ_64MHZ;
   hi2c1.Init.OwnAddress1 = (uint32_t)I2C_SLAVE_ADDRESS << 1;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+#if VIRTUAL_DPS310_ENABLED
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_ENABLE;
+  hi2c1.Init.OwnAddress2 = (uint32_t)VIRTUAL_DPS310_I2C_ADDRESS << 1;
+#else
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
   hi2c1.Init.OwnAddress2 = 0;
+#endif
   hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
   hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
   hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
@@ -797,41 +1056,124 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef *hi2c) {
   }
 }
 
-void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t transfer_direction, uint16_t addr_match_code) {
-  (void)addr_match_code;
-  if (hi2c->Instance != I2C1) {
-    return;
-  }
+static void i2c1_slave_irq_enable(void) {
+  I2C1->ICR = I2C_ICR_ADDRCF | I2C_ICR_NACKCF | I2C_ICR_STOPCF | I2C_ICR_BERRCF | I2C_ICR_ARLOCF | I2C_ICR_OVRCF;
+  I2C1->CR1 |= I2C_CR1_ADDRIE | I2C_CR1_RXIE | I2C_CR1_TXIE | I2C_CR1_NACKIE | I2C_CR1_STOPIE | I2C_CR1_ERRIE;
+}
 
-  if (transfer_direction == I2C_DIRECTION_TRANSMIT) {
-    receive_count++;
-    HAL_I2C_Slave_Seq_Receive_IT(&hi2c1, &rx_byte, 1, I2C_FIRST_AND_LAST_FRAME);
-  } else {
-    __disable_irq();
-    for (uint32_t i = 0; i < MS4525_FRAME_LEN; i++) {
-      tx_frame[i] = response_frame[i];
+static void i2c1_handle_address_match(uint32_t isr) {
+  const uint16_t addr_match = (uint16_t)((isr & I2C_ISR_ADDCODE) >> 16U);
+  const bool master_read = (isr & I2C_ISR_DIR) != 0U;
+  i2c1_active_slave = I2C1_SLAVE_NONE;
+
+  if (addr_match == ((uint16_t)I2C_SLAVE_ADDRESS << 1)) {
+    i2c1_active_slave = I2C1_SLAVE_MS4525;
+  }
+#if VIRTUAL_DPS310_ENABLED
+  else if (addr_match == ((uint16_t)VIRTUAL_DPS310_I2C_ADDRESS << 1)) {
+    i2c1_active_slave = I2C1_SLAVE_DPS310;
+  }
+#endif
+
+  if (master_read) {
+    if (i2c1_active_slave == I2C1_SLAVE_MS4525) {
+      for (uint32_t i = 0; i < MS4525_FRAME_LEN; i++) {
+        tx_frame[i] = response_frame[i];
+      }
+      i2c1_ms4525_tx_index = 0;
     }
-    __enable_irq();
-    request_count++;
-    HAL_I2C_Slave_Seq_Transmit_IT(&hi2c1, tx_frame, MS4525_FRAME_LEN, I2C_FIRST_AND_LAST_FRAME);
+    if (i2c1_active_slave != I2C1_SLAVE_NONE) {
+      request_count++;
+    }
+  } else {
+#if VIRTUAL_DPS310_ENABLED
+    if (i2c1_active_slave == I2C1_SLAVE_DPS310) {
+      dps310_rx_count = 0;
+    }
+#endif
+    if (i2c1_active_slave != I2C1_SLAVE_NONE) {
+      receive_count++;
+    }
+  }
+
+  I2C1->ICR = I2C_ICR_ADDRCF;
+}
+
+static void i2c1_handle_rx_byte(uint8_t value) {
+#if VIRTUAL_DPS310_ENABLED
+  if (i2c1_active_slave == I2C1_SLAVE_DPS310) {
+    if (dps310_rx_count == 0U) {
+      dps310_reg_pointer = value;
+      dps310_rx_count = 1U;
+    } else {
+      dps310_write_register(dps310_reg_pointer, value);
+      dps310_reg_pointer++;
+      dps310_rx_count++;
+    }
+  } else
+#endif
+  {
+    (void)value;
   }
 }
 
-void HAL_I2C_ListenCpltCallback(I2C_HandleTypeDef *hi2c) {
-  if (hi2c->Instance == I2C1) {
-    HAL_I2C_EnableListen_IT(&hi2c1);
+static uint8_t i2c1_next_tx_byte(void) {
+  if (i2c1_active_slave == I2C1_SLAVE_MS4525) {
+    if (i2c1_ms4525_tx_index < MS4525_FRAME_LEN) {
+      return tx_frame[i2c1_ms4525_tx_index++];
+    }
+    return 0xFFU;
   }
-}
 
-void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
-  if (hi2c->Instance == I2C1) {
-    HAL_I2C_EnableListen_IT(&hi2c1);
+#if VIRTUAL_DPS310_ENABLED
+  if (i2c1_active_slave == I2C1_SLAVE_DPS310) {
+    const uint8_t value = dps310_read_register(dps310_reg_pointer);
+    dps310_reg_pointer++;
+    return value;
   }
+#endif
+
+  return 0xFFU;
 }
 
 void I2C1_IRQHandler(void) {
-  HAL_I2C_EV_IRQHandler(&hi2c1);
-  HAL_I2C_ER_IRQHandler(&hi2c1);
+  uint32_t isr = I2C1->ISR;
+
+  if ((isr & I2C_ISR_ADDR) != 0U) {
+    i2c1_handle_address_match(isr);
+    isr = I2C1->ISR;
+  }
+
+  if ((isr & I2C_ISR_RXNE) != 0U) {
+    i2c1_handle_rx_byte((uint8_t)I2C1->RXDR);
+    isr = I2C1->ISR;
+  }
+
+  if ((isr & I2C_ISR_TXIS) != 0U) {
+    I2C1->TXDR = i2c1_next_tx_byte();
+    isr = I2C1->ISR;
+  }
+
+  uint32_t clear_flags = 0;
+  if ((isr & I2C_ISR_NACKF) != 0U) {
+    clear_flags |= I2C_ICR_NACKCF;
+  }
+  if ((isr & I2C_ISR_STOPF) != 0U) {
+    clear_flags |= I2C_ICR_STOPCF;
+    i2c1_active_slave = I2C1_SLAVE_NONE;
+  }
+  if ((isr & I2C_ISR_BERR) != 0U) {
+    clear_flags |= I2C_ICR_BERRCF;
+  }
+  if ((isr & I2C_ISR_ARLO) != 0U) {
+    clear_flags |= I2C_ICR_ARLOCF;
+  }
+  if ((isr & I2C_ISR_OVR) != 0U) {
+    clear_flags |= I2C_ICR_OVRCF;
+  }
+  if (clear_flags != 0U) {
+    I2C1->ICR = clear_flags;
+  }
 }
 
 void I2C2_IRQHandler(void) {
@@ -885,9 +1227,12 @@ int main(void) {
   baro2.online = spa06_begin(&baro2, BARO2_I2C_ADDRESS);
   cal_load_flash_offset();
   update_response_frame();
+#if VIRTUAL_DPS310_ENABLED
+  update_virtual_dps310_frame();
+#endif
 
   MX_I2C1_Init();
-  HAL_I2C_EnableListen_IT(&hi2c1);
+  i2c1_slave_irq_enable();
 
   while (1) {
     update_barometers();

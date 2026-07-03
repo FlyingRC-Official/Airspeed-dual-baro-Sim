@@ -15,6 +15,8 @@ already support MS4525 pitot sensors.
 - STM32G031G8U6 production firmware based on STM32Cube/HAL.
 - Dual SPA06-003 barometer input on a dedicated I2C master bus.
 - MS4525-compatible 4-byte I2C slave frame at address `0x28`.
+- DPS310-compatible virtual barometer at address `0x77` for flight-controller
+  external-baro detection.
 - Startup zero-offset calibration for the barometer pressure difference.
 - Append-only Flash storage for calibration records with CRC32 validation.
 - WS2812 status LED output for factory and field diagnosis.
@@ -43,6 +45,7 @@ Main files:
 | --- | --- |
 | MCU | STM32G031G8U6 |
 | Flight-controller I2C address | `0x28` |
+| Virtual DPS310 I2C address | `0x77` |
 | Flight-controller I2C pins | I2C1 SCL `PB6`, SDA `PB7` |
 | Barometer I2C pins | I2C2 SCL `PA11`, SDA `PA12` |
 | Barometer 1 address | `0x76` |
@@ -53,11 +56,13 @@ Main files:
 Connect SDA, SCL, and GND from the flight controller to the flight-controller
 I2C bus. Use 3.3 V-compatible pullups. Connect both SPA06-003 sensors to the
 barometer I2C bus and set one sensor to `0x76` and the other to `0x77`.
+On flight controllers that already have a real DPS310 at `0x76`, keep the
+virtual DPS310 at `0x77` to avoid an I2C address collision.
 
 ## How It Works
 
-1. At boot, the STM32 initializes I2C1 as an MS4525-compatible I2C slave and
-   I2C2 as the SPA06 barometer master bus.
+1. At boot, the STM32 initializes I2C1 as a dual-address I2C slave and I2C2 as
+   the SPA06 barometer master bus.
 2. The firmware reads both SPA06-003 sensors continuously.
 3. The signed pressure difference is calculated as:
 
@@ -70,6 +75,11 @@ barometer I2C bus and set one sensor to `0x76` and the other to `0x77`.
    temperature frame.
 5. The flight controller sees a normal MS4525 airspeed sensor on I2C address
    `0x28`.
+6. The flight controller also sees a DPS310-compatible virtual barometer on I2C
+   address `0x77`. Before static-side detection locks, this virtual barometer
+   reports the average of both absolute barometers. After local zero offset is
+   available and the corrected pressure difference is stable, the lower-pressure
+   sensor is locked as the static pressure source.
 
 The pressure sign can be changed at build time with `BARO_DIFF_SIGN`.
 
@@ -265,6 +275,10 @@ The main options are set in `platformio.ini`:
 | `BARO2_I2C_ADDRESS` | `0x77` | Second SPA06 address |
 | `BARO_DIFF_SIGN` | `1` | Pressure-difference polarity |
 | `BARO_AUTOZERO` | `1` | Startup local zero handling |
+| `VIRTUAL_DPS310_ENABLED` | `1` | Enable the flight-controller-side virtual DPS310 |
+| `VIRTUAL_DPS310_I2C_ADDRESS` | `0x77` | Virtual DPS310 slave address |
+| `STATIC_DETECT_MIN_DIFF_PA` | `20.0f` | Pressure difference needed to identify static side |
+| `STATIC_DETECT_LOCK_SAMPLES` | `10U` | Consecutive samples required before static-side lock |
 | `DEBUG_LED_ENABLED` | `1` | WS2812 status LED |
 
 ## License
